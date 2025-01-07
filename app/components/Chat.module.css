@@ -160,3 +160,10 @@
 .messageContainer::-webkit-scrollbar-thumb:hover {
   background: #a8adb3;
 }
+
+.errorMessage {
+  color: #ff4444;
+  text-align: center;
+  margin-top: 8px;
+  font-size: 14px;
+}
