@@ -1,6 +1,15 @@
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import Chroma
-from .document_processor import normalize_arabic
+from langchain.memory import ConversationBufferMemory
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationChain
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain.schema import HumanMessage
+from langchain_core.runnables import RunnableWithMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+import logging
+from typing import Tuple, List
+from datetime import datetime
+import os
 from ..config import (
     GOOGLE_API_KEY, 
     EMBEDDING_MODEL, 
@@ -8,36 +17,28 @@ from ..config import (
     CHUNK_RETRIEVAL_K,
     VECTOR_STORE_PATH
 )
-import os
-import logging
-from typing import Tuple, List
-from langchain.schema import SystemMessage, HumanMessage
 
 logger = logging.getLogger(__name__)
+
+class CustomMemory:
+    def __init__(self):
+        """Initialize custom memory to store conversation history."""
+        self.history = []
+
+    async def aget_messages(self) -> List[dict]:
+        """Asynchronously return all messages stored in memory."""
+        return [{"role": "user", "content": msg} for msg in self.history]
+
+    async def aadd_message(self, message: str):
+        """Asynchronously add a message to the history."""
+        self.history.append(message)
+
 
 class ChatProcessor:
     def __init__(self):
         """Initialize the chat processor with necessary components."""
         logger.info("Initializing ChatProcessor...")
-        
-        # Log which models we're using
-        logger.info(f"Using Google API models - Embedding: models/embedding-001, Chat: gemini-1.5-flash")
-        
-        # Initialize the embedding model
-        logger.info("Testing embedding model...")
-        self._embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
-        )
-        
-        # Test the embedding model
-        test_embedding = self._embeddings.embed_query("Test query")
-        logger.info(f"Embedding test successful. Vector dimension: {len(test_embedding)}")
-        
-        # Initialize vector store
-        logger.info("Starting vector store initialization...")
-        self.initialize_vector_store()
-        
+
         # Initialize the chat model
         self._chat_model = ChatGoogleGenerativeAI(
             model="gemini-1.5-flash",
@@ -46,68 +47,81 @@ class ChatProcessor:
             temperature=0.7
         )
 
-    def initialize_vector_store(self):
-        """Load the existing vector store from disk."""
-        logger.info("Starting vector store initialization...")
-        logger.info(f"Loading vector store from: {VECTOR_STORE_PATH}")
-        
-        if not os.path.exists(VECTOR_STORE_PATH):
-            logger.error(f"Vector store not found at {VECTOR_STORE_PATH}")
-            logger.error("Please run create_vector_store.py first to create the vector store")
-            raise FileNotFoundError(f"Vector store not found at {VECTOR_STORE_PATH}")
-            
-        try:
-            logger.info("Loading Chroma vector store...")
-            self._vector_store = Chroma(
-                persist_directory=VECTOR_STORE_PATH,
-                embedding_function=self._embeddings
-            )
-            logger.info("Chroma initialization successful")
-            
-            logger.info(f"Creating retriever with k={CHUNK_RETRIEVAL_K}")
-            self.vector_index = self._vector_store.as_retriever(
-                search_kwargs={"k": CHUNK_RETRIEVAL_K}
-            )
-            logger.info("Retriever created successfully")
-            
-            # Get collection stats
-            collection = self._vector_store._collection
-            count = collection.count()
-            logger.info(f"Vector store loaded successfully with {count} documents")
-            
-            # Log sample documents
-            if count > 0:
-                logger.info("Retrieving sample documents...")
-                sample_results = collection.peek(limit=2)
-                logger.info(f"Retrieved {len(sample_results['documents'])} sample documents")
-                
-                for i, doc in enumerate(sample_results["documents"]):
-                    logger.info(f"Sample document {i+1} content preview: {doc[:200]}...")
-                    logger.info(f"Sample document {i+1} metadata: {sample_results['metadatas'][i]}")
-            else:
-                logger.warning("Vector store exists but contains no documents")
-                
-        except Exception as e:
-            logger.error(f"Error loading vector store: {str(e)}")
-            logger.exception("Full traceback:")
-            raise
-        
-        logger.info("Vector store initialization completed successfully")
+        # Initialize vector store and embeddings
+        self._initialize_embeddings()
+        self.initialize_vector_store()
+
+        # Create conversation template
+        template = """أنت مساعد ذكي. أجب بإيجاز ووضوح.
+
+المحادثة السابقة:
+{history}
+
+السياق من قاعدة المعرفة:
+{context}
+
+السؤال الحالي: {input}
+
+تعليمات مهمة:
+١. استخدم المعلومات من المحادثات السابقة إذا كانت ذات صلة
+٢. استخدم المعلومات من قاعدة المعرفة
+٣. اربط بين المعلومات من المصدرين
+٤. أجب باللغة العربية
+٥. كن دقيقاً ومختصراً
+
+الإجابة:"""
+
+        prompt = PromptTemplate(
+            input_variables=["history", "input", "context"],
+            template=template
+        )
+
+        # Create the chain
+        chain = prompt | self._chat_model | StrOutputParser()
+
+        # Initialize custom memory
+        self._memory = CustomMemory()
+
+        # Add message history
+        self._conversation_chain = RunnableWithMessageHistory(
+            chain,
+            lambda session_id: self._memory,
+            input_messages_key="input",
+            history_messages_key="history",
+        )
 
     async def get_answer(self, question: str) -> Tuple[str, List[dict]]:
-        """
-        Get an answer for the given question using the vector store and chat model.
-        Returns the answer and a list of source documents.
-        """
+        """Get an answer for the given question using the conversation chain and vector store context."""
         try:
-            # Search for relevant documents
+            # Retrieve relevant documents from the vector store
             docs = self._vector_store.similarity_search(question, k=185)
-            
-            # Extract the content and create the context
-            context = "\n\n".join([doc.page_content for doc in docs])
-            logger.info(f"Combined context length: {len(context)} characters")
-            
-            # Create source information
+            docs_context = "\n\n".join([doc.page_content for doc in docs])
+
+            # Retrieve the conversation history
+            history = "\n".join([msg['content'] for msg in await self._memory.aget_messages()])  # Use async get_messages
+
+            # Prepare the input context for the conversation
+            context_input = {
+                "input": question,  # The user's question
+                "context": docs_context,  # The retrieved context from the vector store
+                "history": history  # Use the manually maintained history
+            }
+
+            # Generate response using the conversation chain
+            response = await self._conversation_chain.ainvoke(
+                context_input,
+                config={"configurable": {"session_id": "default"}}  # Ensure session_id is provided
+            )
+            answer = response.strip()
+
+            # Verify Arabic response
+            if not any('\u0600' <= c <= '\u06FF' for c in answer):
+                return f"عذراً، يجب أن تكون الإجابة باللغة العربية. الرجاء إعادة السؤال.", []
+
+            # Update history
+            await self._memory.aadd_message(f"Q: {question}\nA: {answer}")  # Use async add_message
+
+            # Return the answer and the sources
             sources = [
                 {
                     "source": doc.metadata.get("source", "Unknown"),
@@ -115,57 +129,40 @@ class ChatProcessor:
                 }
                 for doc in docs
             ]
-            
-            # Create the prompt
-            prompt = f"""Based on the following context, answer the question in Arabic. If you cannot find a relevant answer in the context, say so.
 
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-            
-            logger.info("Generating answer using AI model...")
-            messages = [SystemMessage(content="You are a helpful assistant that answers questions based on the given context."),
-                       HumanMessage(content=prompt)]
-            
-            response = await self._chat_model.agenerate([messages])
-            answer = response.generations[0][0].text.strip()
-            
-            logger.info(f"Generated answer length: {len(answer)} characters")
             return answer, sources
-            
+
         except Exception as e:
             logger.error(f"Error getting answer: {str(e)}")
-            raise 
+            raise
 
-    def _format_arabic_answer(self, text: str) -> str:
-        """Format Arabic text with proper styling."""
-        # Split text into lines
-        lines = text.split('*')
-        
-        # Process each line
-        formatted_lines = []
-        for line in lines:
-            line = line.strip()
-            if line:
-                # Add bullet point if line doesn't start with one
-                if not line.startswith('•'):
-                    line = '• ' + line
-                formatted_lines.append(line)
-        
-        # Join lines with proper spacing
-        text = '\n'.join(formatted_lines)
-        
-        # Add proper spacing after punctuation
-        text = text.replace('،', '، ')
-        text = text.replace(':', ':\n')
-        
-        # Clean up any extra whitespace
-        text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
-        
-        # Add right-to-left mark for proper text alignment
-        text = '\u200F' + text
-        
-        return text 
+    def _initialize_embeddings(self):
+        """Initialize the embedding model."""
+        logger.info("Initializing embedding model...")
+        self._embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY
+        )
+        # Test embeddings
+        test_embedding = self._embeddings.embed_query("Test query")
+        logger.info(f"Embedding test successful. Vector dimension: {len(test_embedding)}")
+
+    def initialize_vector_store(self):
+        """Load the existing vector store from disk."""
+        logger.info("Starting vector store initialization...")
+        logger.info(f"Loading vector store from: {VECTOR_STORE_PATH}")
+
+        if not os.path.exists(VECTOR_STORE_PATH):
+            logger.error(f"Vector store not found at {VECTOR_STORE_PATH}")
+            raise FileNotFoundError(f"Vector store not found at {VECTOR_STORE_PATH}")
+
+        try:
+            logger.info("Loading Chroma vector store...")
+            self._vector_store = Chroma(
+                persist_directory=VECTOR_STORE_PATH,
+                embedding_function=self._embeddings
+            )
+            logger.info("Chroma initialization successful")
+        except Exception as e:
+            logger.error(f"Error loading vector store: {str(e)}")
+            raise
