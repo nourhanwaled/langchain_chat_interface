@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import styles from "./Chat.module.css";
 
 const API_URL = "http://localhost:8000";
@@ -27,6 +27,12 @@ const Chat: React.FC = () => {
     }>
   >([]);
 
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  const scrollToBottom = () => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
   useEffect(() => {
     setMessages([
       {
@@ -41,6 +47,10 @@ const Chat: React.FC = () => {
       },
     ]);
   }, []);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -188,6 +198,7 @@ const Chat: React.FC = () => {
             <div className={styles.timestamp}>{message.timestamp}</div>
           </div>
         ))}
+        <div ref={chatEndRef} />
       </div>
 
       {/* Input Area */}
