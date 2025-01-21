@@ -98,19 +98,19 @@ class ChatProcessor:
             docs_context = "\n\n".join([doc.page_content for doc in docs])
 
             # Retrieve the conversation history
-            history = "\n".join([msg['content'] for msg in await self._memory.aget_messages()])  # Use async get_messages
+            history = "\n".join([msg['content'] for msg in await self._memory.aget_messages()])
 
             # Prepare the input context for the conversation
             context_input = {
-                "input": question,  # The user's question
-                "context": docs_context,  # The retrieved context from the vector store
-                "history": history  # Use the manually maintained history
+                "input": question,
+                "context": docs_context,
+                "history": history
             }
 
             # Generate response using the conversation chain
             response = await self._conversation_chain.ainvoke(
                 context_input,
-                config={"configurable": {"session_id": "default"}}  # Ensure session_id is provided
+                config={"configurable": {"session_id": "default"}}
             )
             answer = response.strip()
 
@@ -118,19 +118,31 @@ class ChatProcessor:
             if not any('\u0600' <= c <= '\u06FF' for c in answer):
                 return f"عذراً، يجب أن تكون الإجابة باللغة العربية. الرجاء إعادة السؤال.", []
 
-            # Update history
-            await self._memory.aadd_message(f"Q: {question}\nA: {answer}")  # Use async add_message
+            # Add citation for the most relevant document
+            most_relevant_doc = docs[0] if docs else None
+            if most_relevant_doc:
+                source = most_relevant_doc.metadata.get('source', 'Unknown')
+                link = most_relevant_doc.metadata.get('link', 'No link available')
+                logger.info(f"Document Source: {source}, Link: {link}")  # Debugging line
+                citation = f"Source: {source}\nLink: {link}"
+            else:
+                citation = "Source: Unknown\nLink: No link available"
 
-            # Return the answer and the sources
+            answer_with_citation = f"{answer}\n\n---\n\n{citation}"
+
+            # Update history
+            await self._memory.aadd_message(f"Q: {question}\nA: {answer_with_citation}")
+
+            # Return the answer with citation and the sources
             sources = [
                 {
-                    "source": doc.metadata.get("source", "Unknown"),
-                    "content": doc.page_content[:200] + "..."
+                    "source": source,
+                    "content": most_relevant_doc.page_content[:200] + "...",
+                    "link": link
                 }
-                for doc in docs
-            ]
+            ] if most_relevant_doc else []
 
-            return answer, sources
+            return answer_with_citation, sources
 
         except Exception as e:
             logger.error(f"Error getting answer: {str(e)}")

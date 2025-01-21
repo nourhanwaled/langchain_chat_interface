@@ -2,10 +2,12 @@ import os
 import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from app.utils.chat_processor import ChatProcessor
 from app.config import DATA_FOLDER
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -76,7 +78,6 @@ async def ask_question(request: QuestionRequest):
     except Exception as e:
         logger.error(f"Error processing question: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/check-vector-store")
 async def check_vector_store():
     """Endpoint to check the contents of the vector store"""
@@ -107,3 +108,16 @@ async def check_vector_store():
     except Exception as e:
         logger.error(f"Error checking vector store: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e)) 
+
+@app.get("/stream")
+async def stream(question: str):
+    if not chat_processor:
+        raise HTTPException(status_code=500, detail="Chat processor not initialized")
+
+    async def event_generator():
+        answer, _ = await chat_processor.get_answer(question)
+        for part in answer.split():
+            yield f"data: {part}\n\n"
+            time.sleep(0.5)  # Adjust timing as needed
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
